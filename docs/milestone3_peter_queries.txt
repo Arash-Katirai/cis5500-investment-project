@@ -355,21 +355,5 @@ Complexity: 2 CTEs, DISTINCT ON, RANK() window function, multi-table
             scalar subquery, derived columns
 
 
-================================================================================
-DATABASE CREDENTIALS
-================================================================================
-
-Host:     cis5500-investment.c1234example.us-east-1.rds.amazonaws.com
-Port:     5432
-Database: investment_db
-Username: guest_reader
-Password: cis5500_guest_2025
-
-NOTE: The above are placeholder credentials. Please replace with the
-actual AWS RDS credentials once the database is deployed. To connect:
-
-  psql -h <host> -p 5432 -U guest_reader -d investment_db
-
-Or set environment variables per the .env.example file in the repo root.
 
 ================================================================================
