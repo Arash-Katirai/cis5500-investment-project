@@ -1,0 +1,375 @@
+================================================================================
+  Milestone 3 — Database Population and SQL Queries
+  Page 1: Home / Retirement Planner
+  Author: Peter Dankert (petedank)
+================================================================================
+
+
+------------------------------------------------------------------------
+QUERY 1: Allocation with Historical Market Validation
+------------------------------------------------------------------------
+
+Description:
+Returns the recommended stock/bond allocation for a given retirement year
+and risk profile, enriched with historical annualized market return,
+volatility, and Sharpe ratio computed over the user's time horizon. Uses
+a blended expected return (stocks at the historical market rate, bonds at
+a fixed 3%) to show the user what their allocation might yield.
+
+SQL:
+WITH target_allocation AS (
+    SELECT
+        years_to_retirement,
+        risk_profile,
+        stock_percentage,
+        bond_percentage
+    FROM asset_allocations
+    WHERE years_to_retirement = ($1 - EXTRACT(YEAR FROM CURRENT_DATE)::INT)
+      AND risk_profile = $2
+),
+market_daily AS (
+    SELECT
+        price_date,
+        SUM(adjusted_close * 1.0) AS market_value
+    FROM stock_prices
+    WHERE price_date >= CURRENT_DATE
+          - ($1 - EXTRACT(YEAR FROM CURRENT_DATE)::INT) * INTERVAL '1 year'
+    GROUP BY price_date
+),
+market_returns AS (
+    SELECT
+        price_date,
+        market_value,
+        LAG(market_value) OVER (ORDER BY price_date) AS prev_value,
+        CASE
+            WHEN LAG(market_value) OVER (ORDER BY price_date) > 0
+            THEN (market_value - LAG(market_value) OVER (ORDER BY price_date))
+                 / LAG(market_value) OVER (ORDER BY price_date)
+            ELSE NULL
+        END AS daily_return
+    FROM market_daily
+),
+market_stats AS (
+    SELECT
+        AVG(daily_return) * 252 AS annualized_return,
+        STDDEV(daily_return) * SQRT(252) AS annualized_volatility,
+        CASE
+            WHEN STDDEV(daily_return) > 0
+            THEN (AVG(daily_return) * 252) / (STDDEV(daily_return) * SQRT(252))
+            ELSE NULL
+        END AS sharpe_ratio,
+        COUNT(*) AS trading_days
+    FROM market_returns
+    WHERE daily_return IS NOT NULL
+)
+SELECT
+    ta.years_to_retirement,
+    ta.risk_profile,
+    ta.stock_percentage,
+    ta.bond_percentage,
+    ROUND(ms.annualized_return::NUMERIC * 100, 2) AS historical_annual_return_pct,
+    ROUND(ms.annualized_volatility::NUMERIC * 100, 2) AS historical_volatility_pct,
+    ROUND(ms.sharpe_ratio::NUMERIC, 3) AS sharpe_ratio,
+    ROUND(
+        (ta.stock_percentage / 100 * ms.annualized_return +
+         ta.bond_percentage / 100 * 0.03)::NUMERIC * 100, 2
+    ) AS blended_return_pct,
+    ms.trading_days
+FROM target_allocation ta
+CROSS JOIN market_stats ms;
+
+Complexity: 4 CTEs, LAG() window function, AVG/STDDEV aggregation,
+            CROSS JOIN, parameterized input
+
+
+------------------------------------------------------------------------
+QUERY 2: Risk Profile Comparison with Top Sectors
+------------------------------------------------------------------------
+
+Description:
+For a given retirement year, shows all three risk profiles (Conservative,
+Moderate, Aggressive) side-by-side, each enriched with the top 5 sectors
+ranked by average composite factor score. This lets the user compare
+allocations and see which sectors the model currently favors.
+
+SQL:
+WITH all_profiles AS (
+    SELECT
+        years_to_retirement,
+        risk_profile,
+        stock_percentage,
+        bond_percentage
+    FROM asset_allocations
+    WHERE years_to_retirement = ($1 - EXTRACT(YEAR FROM CURRENT_DATE)::INT)
+),
+top_sectors AS (
+    SELECT
+        c.sector,
+        AVG(fs.composite_score) AS avg_composite_score,
+        COUNT(*) AS num_companies,
+        RANK() OVER (ORDER BY AVG(fs.composite_score) DESC) AS sector_rank
+    FROM factor_scores fs
+    JOIN companies c ON fs.ticker = c.ticker
+    WHERE fs.calculation_date = (
+        SELECT MAX(calculation_date) FROM factor_scores
+    )
+    GROUP BY c.sector
+)
+SELECT
+    ap.risk_profile,
+    ap.stock_percentage,
+    ap.bond_percentage,
+    ts.sector,
+    ROUND(ts.avg_composite_score::NUMERIC, 4) AS avg_composite_score,
+    ts.num_companies,
+    ts.sector_rank
+FROM all_profiles ap
+CROSS JOIN (
+    SELECT sector, avg_composite_score, num_companies, sector_rank
+    FROM top_sectors
+    WHERE sector_rank <= 5
+) ts
+ORDER BY ap.risk_profile, ts.sector_rank;
+
+Complexity: 2 CTEs, RANK() window function, JOIN, scalar subquery,
+            GROUP BY, CROSS JOIN
+
+
+------------------------------------------------------------------------
+QUERY 3: Allocation Glide Path (All Horizons for a Risk Profile)
+------------------------------------------------------------------------
+
+Description:
+Returns the full allocation glide path for a given risk profile, showing
+how the stock/bond split changes as years-to-retirement decreases. This
+powers the glide-path chart on the Retirement Planner page.
+
+SQL:
+SELECT
+    years_to_retirement,
+    risk_profile,
+    stock_percentage,
+    bond_percentage,
+    stock_percentage - LAG(stock_percentage)
+        OVER (ORDER BY years_to_retirement DESC) AS stock_pct_change
+FROM asset_allocations
+WHERE risk_profile = $1
+ORDER BY years_to_retirement DESC;
+
+Complexity: LAG() window function, parameterized filter, ordering
+
+
+------------------------------------------------------------------------
+QUERY 4: Sector Concentration Risk for a Given Allocation
+------------------------------------------------------------------------
+
+Description:
+For the user's recommended allocation, identifies the top stocks by
+composite factor score, then computes sector concentration to flag
+diversification risk. Groups recommended stocks by sector and shows what
+percentage of the top-ranked stocks fall in each sector.
+
+SQL:
+WITH latest_scores AS (
+    SELECT
+        fs.ticker,
+        fs.composite_score,
+        c.sector,
+        c.short_name,
+        c.market_cap_category,
+        RANK() OVER (ORDER BY fs.composite_score DESC) AS overall_rank
+    FROM factor_scores fs
+    JOIN companies c ON fs.ticker = c.ticker
+    WHERE fs.calculation_date = (
+        SELECT MAX(calculation_date) FROM factor_scores
+    )
+      AND fs.composite_score IS NOT NULL
+),
+top_stocks AS (
+    SELECT * FROM latest_scores WHERE overall_rank <= 25
+)
+SELECT
+    sector,
+    COUNT(*) AS stocks_in_sector,
+    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM top_stocks), 1)
+        AS sector_weight_pct,
+    ROUND(AVG(composite_score)::NUMERIC, 4) AS avg_score,
+    STRING_AGG(short_name, ', ' ORDER BY overall_rank) AS companies
+FROM top_stocks
+GROUP BY sector
+ORDER BY stocks_in_sector DESC;
+
+Complexity: 2 CTEs, RANK() window function, scalar subquery in SELECT,
+            JOIN, GROUP BY, STRING_AGG aggregation
+
+
+------------------------------------------------------------------------
+QUERY 5: Historical Drawdown Analysis by Risk Profile
+------------------------------------------------------------------------
+
+Description:
+Calculates the worst historical drawdown (peak-to-trough decline) for
+the overall market over different time windows (1-year, 5-year, 10-year).
+This helps the user understand the downside risk associated with their
+chosen allocation and time horizon.
+
+SQL:
+WITH monthly_market AS (
+    SELECT
+        DATE_TRUNC('month', price_date) AS month,
+        SUM(adjusted_close) AS market_value
+    FROM stock_prices
+    GROUP BY DATE_TRUNC('month', price_date)
+),
+running_peak AS (
+    SELECT
+        month,
+        market_value,
+        MAX(market_value) OVER (ORDER BY month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            AS peak_value
+    FROM monthly_market
+),
+drawdowns AS (
+    SELECT
+        month,
+        market_value,
+        peak_value,
+        ROUND(((market_value - peak_value) / NULLIF(peak_value, 0) * 100)::NUMERIC, 2)
+            AS drawdown_pct
+    FROM running_peak
+)
+SELECT
+    period_label,
+    ROUND(MIN(d.drawdown_pct)::NUMERIC, 2) AS max_drawdown_pct,
+    (SELECT month FROM drawdowns
+     WHERE drawdown_pct = MIN(d.drawdown_pct)
+       AND month >= cutoff
+     LIMIT 1) AS worst_month
+FROM drawdowns d
+CROSS JOIN (
+    VALUES
+        ('1-year',  CURRENT_DATE - INTERVAL '1 year'),
+        ('5-year',  CURRENT_DATE - INTERVAL '5 years'),
+        ('10-year', CURRENT_DATE - INTERVAL '10 years')
+) AS periods(period_label, cutoff)
+WHERE d.month >= cutoff
+GROUP BY period_label, cutoff
+ORDER BY period_label;
+
+Complexity: 3 CTEs, MAX() window function with frame clause,
+            CROSS JOIN VALUES, correlated subquery, GROUP BY
+
+
+------------------------------------------------------------------------
+QUERY 6: Market Summary Statistics for the Landing Page
+------------------------------------------------------------------------
+
+Description:
+Retrieves high-level market summary statistics displayed on the home page:
+total number of companies in the database, sector count, date range of
+price data, and the most recent average composite factor score. Gives the
+user confidence in the breadth and recency of the underlying data.
+
+SQL:
+SELECT
+    (SELECT COUNT(*) FROM companies) AS total_companies,
+    (SELECT COUNT(DISTINCT sector) FROM companies) AS total_sectors,
+    (SELECT MIN(price_date) FROM stock_prices) AS earliest_price_date,
+    (SELECT MAX(price_date) FROM stock_prices) AS latest_price_date,
+    (SELECT ROUND(AVG(composite_score)::NUMERIC, 4)
+     FROM factor_scores
+     WHERE calculation_date = (SELECT MAX(calculation_date) FROM factor_scores)
+    ) AS avg_composite_score,
+    (SELECT COUNT(DISTINCT ticker)
+     FROM stock_prices
+     WHERE price_date = (SELECT MAX(price_date) FROM stock_prices)
+    ) AS active_tickers;
+
+Complexity: Multiple scalar subqueries, nested subquery
+
+
+------------------------------------------------------------------------
+QUERY 7: Top Stocks Preview for a Given Risk Horizon
+------------------------------------------------------------------------
+
+Description:
+Given a retirement year, returns the top 10 stocks by composite factor
+score along with their latest financial metrics (profit margin, P/E ratio
+approximation via net income / market cap), giving the user a preview of
+what the portfolio builder might recommend.
+
+SQL:
+WITH latest_financials AS (
+    SELECT DISTINCT ON (ticker)
+        ticker,
+        statement_date,
+        total_revenue,
+        net_income,
+        gross_profit,
+        CASE WHEN total_revenue > 0
+             THEN ROUND((net_income / total_revenue * 100)::NUMERIC, 2)
+             ELSE NULL
+        END AS profit_margin_pct
+    FROM financial_statements
+    ORDER BY ticker, statement_date DESC
+),
+scored AS (
+    SELECT
+        fs.ticker,
+        c.short_name,
+        c.sector,
+        c.market_cap,
+        c.market_cap_category,
+        fs.value_score,
+        fs.momentum_score,
+        fs.profitability_score,
+        fs.composite_score,
+        lf.profit_margin_pct,
+        lf.total_revenue,
+        RANK() OVER (ORDER BY fs.composite_score DESC) AS score_rank
+    FROM factor_scores fs
+    JOIN companies c ON fs.ticker = c.ticker
+    JOIN latest_financials lf ON fs.ticker = lf.ticker
+    WHERE fs.calculation_date = (
+        SELECT MAX(calculation_date) FROM factor_scores
+    )
+)
+SELECT
+    ticker,
+    short_name,
+    sector,
+    market_cap_category,
+    ROUND(composite_score::NUMERIC, 4) AS composite_score,
+    ROUND(value_score::NUMERIC, 4) AS value_score,
+    ROUND(momentum_score::NUMERIC, 4) AS momentum_score,
+    ROUND(profitability_score::NUMERIC, 4) AS profitability_score,
+    profit_margin_pct,
+    ROUND((total_revenue / 1e9)::NUMERIC, 2) AS revenue_billions,
+    score_rank
+FROM scored
+WHERE score_rank <= 10
+ORDER BY score_rank;
+
+Complexity: 2 CTEs, DISTINCT ON, RANK() window function, multi-table
+            JOIN (factor_scores + companies + financial_statements),
+            scalar subquery, derived columns
+
+
+================================================================================
+DATABASE CREDENTIALS
+================================================================================
+
+Host:     cis5500-investment.c1234example.us-east-1.rds.amazonaws.com
+Port:     5432
+Database: investment_db
+Username: guest_reader
+Password: cis5500_guest_2025
+
+NOTE: The above are placeholder credentials. Please replace with the
+actual AWS RDS credentials once the database is deployed. To connect:
+
+  psql -h <host> -p 5432 -U guest_reader -d investment_db
+
+Or set environment variables per the .env.example file in the repo root.
+
+================================================================================
