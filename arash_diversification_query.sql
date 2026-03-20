@@ -1,8 +1,6 @@
 -- Screener Results with Sector Diversification Analysis
 -- Description: Takes the top-ranked stocks from the factor-weighted
--- screener (using P/B value, ROA profitability, 12-month momentum,
--- and size via PERCENT_RANK) and conducts sector-level
--- concentration analysis. Flags over-concentrated sectors to help
+-- screener and analyzes how diversified the portfolio is. Flags over-concentrated sectors to help
 -- users understand portfolio risk before committing.
 
 WITH
@@ -107,12 +105,12 @@ top_stocks AS (
         sector,
         market_cap_category,
         market_cap,
-        ROUND(
-            (value_score         * :weight_value)         +
-            (profitability_score * :weight_profitability) +
-            (momentum_score      * :weight_momentum)      +
-            (size_score          * :weight_size),
-        4) AS composite_score
+        ROUND((
+                  (value_score * :weight_value) +
+                  (profitability_score * :weight_profitability) +
+                  (momentum_score * :weight_momentum) +
+                  (size_score * :weight_size)
+                  )::numeric, 4) AS composite_score
     FROM ranked
     ORDER BY composite_score DESC
     LIMIT 25
