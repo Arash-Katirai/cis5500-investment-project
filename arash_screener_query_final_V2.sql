@@ -1,9 +1,8 @@
--- Stock Screener Query 
+-- Stock Screener Query
 -- Description: Computes a composite factor score for each stock
--- by ranking value (price-to-book), profitability (ROA), momentum
--- (12-month return), and size (market cap) using PERCENT_RANK
--- normalization across the filtered universe, then combines them
--- using user-defined weights. Returns the top 25 stocks.
+-- by ranking value, profitability, momentum and size using PERCENT_RANK
+-- normalizes and then combines them using user-defined weights.
+-- Returns the top 25 stocks.
 
 WITH
 
@@ -116,20 +115,20 @@ SELECT
     company_name,
     sector,
     market_cap_category,
-    ROUND(market_cap, 0)                                        AS market_cap_millions,
-    ROUND(value_raw, 4)                                         AS book_to_market,
-    ROUND(profitability_raw, 4)                                 AS return_on_assets,
-    ROUND(momentum_raw * 100, 2)                                AS momentum_12m_pct,
-    ROUND(value_score, 4)                                       AS value_score,
-    ROUND(profitability_score, 4)                               AS profitability_score,
-    ROUND(momentum_score, 4)                                    AS momentum_score,
-    ROUND(size_score, 4)                                        AS size_score,
-    ROUND(
+    ROUND(market_cap::numeric, 0)                                        AS market_cap_millions,
+    ROUND(value_raw::numeric, 4)                                         AS book_to_market,
+    ROUND(profitability_raw::numeric, 4)                                 AS return_on_assets,
+    ROUND((momentum_raw * 100)::numeric, 2)                             AS momentum_12m_pct,
+    ROUND(value_score::numeric, 4)                                       AS value_score,
+    ROUND(profitability_score::numeric, 4)                               AS profitability_score,
+    ROUND(momentum_score::numeric, 4)                                    AS momentum_score,
+    ROUND(size_score::numeric, 4)                                        AS size_score,
+    ROUND((
         (value_score         * :weight_value)          +   -- e.g. 0.40
         (profitability_score * :weight_profitability)  +   -- e.g. 0.30
         (momentum_score      * :weight_momentum)       +   -- e.g. 0.20
-        (size_score          * :weight_size),              -- e.g. 0.10
-    4)                                                          AS composite_score
+        (size_score          * :weight_size)              -- e.g. 0.10
+    )::numeric, 4)                                                          AS composite_score
 FROM ranked
 ORDER BY composite_score DESC
 LIMIT 25;
